@@ -170,9 +170,15 @@ _load_env_file_into_config() {
     local filepath="$1" loaded=0
     local line="" key="" value=""
 
-    [[ -f "$filepath" ]] || return 0
+    # Files under /root/ require sudo to stat and read when running as non-root.
+    local can_read=false
+    if [[ "$filepath" == /root/* ]] && [[ "$EUID" -ne 0 ]]; then
+        sudo test -f "$filepath" 2>/dev/null && can_read=true
+    else
+        [[ -f "$filepath" ]] && can_read=true
+    fi
+    $can_read || return 0
 
-    # For files under /root/ we need sudo to read them
     local reader=("cat" "$filepath")
     if [[ "$filepath" == /root/* ]] && [[ "$EUID" -ne 0 ]]; then
         reader=("sudo" "cat" "$filepath")
@@ -189,30 +195,27 @@ _load_env_file_into_config() {
         value=$(strip_surrounding_quotes "$value")
         [[ -n "$key" && -n "$value" ]] || continue
         GLOBAL_CONFIG["$key"]="$value"
-        (( loaded += 1 ))
+        loaded=$(( loaded + 1 ))
     done < <("${reader[@]}" 2>/dev/null)
 
-    (( loaded > 0 )) && log_info "Loaded $loaded keys from $filepath"
+    if [[ $loaded -gt 0 ]]; then
+        log_info "Loaded $loaded keys from $filepath"
+    fi
     return 0
 }
 
 load_global_env_config() {
-    local total=0
-
     # Layer 1 — persistent user defaults in /root/wp-creds/.env
     # Loaded first so layer 2 can override any key.
     if sudo test -f "$GLOBAL_CREDS_ENV_FILE" 2>/dev/null; then
         _load_env_file_into_config "$GLOBAL_CREDS_ENV_FILE"
-        (( total += ${#GLOBAL_CONFIG[@]} ))
         print_info "Loaded defaults from $GLOBAL_CREDS_ENV_FILE"
     fi
 
     # Layer 2 — local .env next to the script (higher priority)
     if [[ -f "$GLOBAL_ENV_FILE" ]]; then
-        local before=${#GLOBAL_CONFIG[@]}
         _load_env_file_into_config "$GLOBAL_ENV_FILE"
-        local after=${#GLOBAL_CONFIG[@]}
-        print_info "Loaded overrides from config"
+        print_info "Loaded overrides from $GLOBAL_ENV_FILE"
     fi
 
     log_info "Global config loaded: ${#GLOBAL_CONFIG[@]} keys total"
