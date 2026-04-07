@@ -1769,18 +1769,42 @@ wait_for_mysql() {
     step 11 "Waiting for MySQL..."
     local timeout=60
     local elapsed=0
+
+    # Phase 1: daemon liveness (mysqladmin ping)
     while (( elapsed < timeout )); do
         if sudo docker exec "${INSTANCE_NAME}-mysql" mysqladmin ping -h localhost --silent 2>/dev/null; then
-            print_success "MySQL is ready"
-            return 0
+            break
         fi
         sleep 2
         (( elapsed += 2 ))
         local pct=$(( ${_STEP_END[10]} + (elapsed * (${_STEP_END[11]} - ${_STEP_END[10]}) / timeout) ))
-        progress_bar "$pct" "Waiting for MySQL... (${elapsed}s/${timeout}s)"
+        progress_bar "$pct" "Waiting for MySQL daemon... (${elapsed}s/${timeout}s)"
     done
-    print_error "MySQL failed to start within ${timeout}s"
-    log_error "MySQL health check timeout after ${timeout}s"
+    if (( elapsed >= timeout )); then
+        print_error "MySQL failed to start within ${timeout}s"
+        log_error "MySQL health check timeout after ${timeout}s"
+        return 1
+    fi
+
+    # Phase 2: wait for the WordPress user + database to be initialized.
+    # MySQL's entrypoint init scripts run after the daemon starts, so
+    # the user may not exist yet even though the ping passed.
+    local user_timeout=60
+    local user_elapsed=0
+    while (( user_elapsed < user_timeout )); do
+        if sudo docker exec "${INSTANCE_NAME}-mysql" \
+               mysql -u"${MYSQL_USER}" -p"${MYSQL_PASSWORD}" \
+               "${MYSQL_DATABASE}" -e "SELECT 1" 2>/dev/null | grep -q 1; then
+            print_success "MySQL is ready (user verified)"
+            return 0
+        fi
+        sleep 2
+        (( user_elapsed += 2 ))
+        local pct2=$(( ${_STEP_END[10]} + ((elapsed + user_elapsed) * (${_STEP_END[11]} - ${_STEP_END[10]}) / (timeout + user_timeout)) ))
+        progress_bar "$pct2" "Waiting for MySQL user init... (${user_elapsed}s)"
+    done
+    print_error "MySQL user '${MYSQL_USER}' not ready after ${user_timeout}s"
+    log_error "MySQL user init timeout after ${user_timeout}s"
     return 1
 }
 
