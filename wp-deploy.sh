@@ -18,6 +18,9 @@ CF_USER_CONFIG_DIR="/root/.cloudflared"
 CF_CERT="/root/.cloudflared/cert.pem"
 GLOBAL_ENV_FILE="$SCRIPT_DIR/.env"
 GLOBAL_ENV_TEMPLATE="$SCRIPT_DIR/.env.template"
+# Persistent user defaults stored outside the script directory.
+# Loaded before GLOBAL_ENV_FILE so local overrides take precedence.
+GLOBAL_CREDS_ENV_FILE="/root/wp-creds/.env"
 declare -A GLOBAL_CONFIG=()
 LOG_FILE=""
 CURRENT_STEP=0
@@ -163,31 +166,56 @@ validate_port_value() {
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
 }
 
-load_global_env_config() {
-    local line="" key="" value="" loaded=0
+_load_env_file_into_config() {
+    local filepath="$1" loaded=0
+    local line="" key="" value=""
 
-    [[ -f "$GLOBAL_ENV_FILE" ]] || return 0
+    [[ -f "$filepath" ]] || return 0
+
+    # For files under /root/ we need sudo to read them
+    local reader=("cat" "$filepath")
+    if [[ "$filepath" == /root/* ]] && [[ "$EUID" -ne 0 ]]; then
+        reader=("sudo" "cat" "$filepath")
+    fi
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%$'\r'}"
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
-
-        if [[ "$line" == export[[:space:]]* ]]; then
-            line="${line#export }"
-        fi
-
+        [[ "$line" == export[[:space:]]* ]] && line="${line#export }"
         [[ "$line" == *=* ]] || continue
         key=$(trim_whitespace "${line%%=*}")
         value=$(trim_whitespace "${line#*=}")
         value=$(strip_surrounding_quotes "$value")
-        [[ -n "$key" ]] || continue
+        [[ -n "$key" && -n "$value" ]] || continue
         GLOBAL_CONFIG["$key"]="$value"
         (( loaded += 1 ))
-    done < "$GLOBAL_ENV_FILE"
+    done < <("${reader[@]}" 2>/dev/null)
 
-    print_info "Loaded runtime overrides from $GLOBAL_ENV_FILE ($loaded keys)"
-    log_info "Loaded runtime overrides from $GLOBAL_ENV_FILE ($loaded keys)"
+    (( loaded > 0 )) && log_info "Loaded $loaded keys from $filepath"
+    return 0
+}
+
+load_global_env_config() {
+    local total=0
+
+    # Layer 1 — persistent user defaults in /root/wp-creds/.env
+    # Loaded first so layer 2 can override any key.
+    if sudo test -f "$GLOBAL_CREDS_ENV_FILE" 2>/dev/null; then
+        _load_env_file_into_config "$GLOBAL_CREDS_ENV_FILE"
+        (( total += ${#GLOBAL_CONFIG[@]} ))
+        print_info "Loaded defaults from $GLOBAL_CREDS_ENV_FILE"
+    fi
+
+    # Layer 2 — local .env next to the script (higher priority)
+    if [[ -f "$GLOBAL_ENV_FILE" ]]; then
+        local before=${#GLOBAL_CONFIG[@]}
+        _load_env_file_into_config "$GLOBAL_ENV_FILE"
+        local after=${#GLOBAL_CONFIG[@]}
+        print_info "Loaded overrides from config"
+    fi
+
+    log_info "Global config loaded: ${#GLOBAL_CONFIG[@]} keys total"
 }
 
 # ── Docker Compose Helper ────────────────────────────────
@@ -975,7 +1003,7 @@ get_next_port() {
     local port="${GLOBAL_CONFIG[HTTP_PORT]:-8080}"
 
     if ! validate_port_value "$port"; then
-        log_warn "Invalid HTTP_PORT override '${port:-}' in $GLOBAL_ENV_FILE; falling back to 8080"
+        log_warn "Invalid HTTP_PORT override '${port:-}' in config; falling back to 8080"
         port=8080
     fi
 
@@ -1320,7 +1348,7 @@ prompt_instance_config() {
     # Instance name
     if global_config_has_value INSTANCE_NAME; then
         INSTANCE_NAME="$(global_config_get INSTANCE_NAME)"
-        print_info "Using instance name from $GLOBAL_ENV_FILE: $INSTANCE_NAME"
+        print_info "Using instance name from config: $INSTANCE_NAME"
     else
         read -rp "$(echo -e "${CYAN}Instance name${NC} [$default_name]: ")" INSTANCE_NAME
         INSTANCE_NAME="${INSTANCE_NAME:-$default_name}"
@@ -1342,7 +1370,7 @@ prompt_instance_config() {
     if global_config_has_value WP_PORT; then
         WP_PORT="$(global_config_get WP_PORT)"
         if ! validate_port_value "$WP_PORT"; then
-            print_error "Invalid WP_PORT override '$WP_PORT' in $GLOBAL_ENV_FILE"
+            print_error "Invalid WP_PORT override '$WP_PORT' in config"
             exit 1
         fi
     else
@@ -1379,7 +1407,7 @@ prompt_instance_config() {
         echo ""
         if global_config_has_value CF_HOSTNAME; then
             CF_HOSTNAME="$(global_config_get CF_HOSTNAME)"
-            print_info "Using hostname from $GLOBAL_ENV_FILE: $CF_HOSTNAME"
+            print_info "Using hostname from config: $CF_HOSTNAME"
         elif [[ -n "$configured_domain" ]]; then
             while true; do
                 read -rp "$(echo -e "${CYAN}Subdomain or full hostname${NC} (e.g. myblog or myblog.${configured_domain}): ")" hostname_input
@@ -1408,7 +1436,7 @@ prompt_instance_config() {
     # Site title
     if global_config_has_value WP_SITE_TITLE; then
         WP_SITE_TITLE="$(global_config_get WP_SITE_TITLE)"
-        print_info "Using site title from $GLOBAL_ENV_FILE: $WP_SITE_TITLE"
+        print_info "Using site title from config: $WP_SITE_TITLE"
     else
         read -rp "$(echo -e "${CYAN}Site title${NC} [My WordPress Site]: ")" WP_SITE_TITLE
         WP_SITE_TITLE="${WP_SITE_TITLE:-My WordPress Site}"
@@ -1417,7 +1445,7 @@ prompt_instance_config() {
     # Admin user
     if global_config_has_value WP_ADMIN_USER; then
         WP_ADMIN_USER="$(global_config_get WP_ADMIN_USER)"
-        print_info "Using admin username from $GLOBAL_ENV_FILE: $WP_ADMIN_USER"
+        print_info "Using admin username from config: $WP_ADMIN_USER"
     else
         read -rp "$(echo -e "${CYAN}Admin username${NC} [admin]: ")" WP_ADMIN_USER
         WP_ADMIN_USER="${WP_ADMIN_USER:-admin}"
@@ -1426,7 +1454,7 @@ prompt_instance_config() {
     # Admin password
     if global_config_has_value WP_ADMIN_PASSWORD; then
         WP_ADMIN_PASSWORD="$(global_config_get WP_ADMIN_PASSWORD)"
-        print_info "Using admin password from $GLOBAL_ENV_FILE"
+        print_info "Using admin password from config"
     else
         read -rsp "$(echo -e "${CYAN}Admin password${NC} [blank=random]: ")" WP_ADMIN_PASSWORD
         echo ""
@@ -1440,10 +1468,10 @@ prompt_instance_config() {
     if global_config_has_value WP_ADMIN_EMAIL; then
         WP_ADMIN_EMAIL="$(global_config_get WP_ADMIN_EMAIL)"
         if [[ ! "$WP_ADMIN_EMAIL" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then
-            print_warn "Invalid WP_ADMIN_EMAIL in $GLOBAL_ENV_FILE; prompting instead"
+            print_warn "Invalid WP_ADMIN_EMAIL in config; prompting instead"
             WP_ADMIN_EMAIL=""
         else
-            print_info "Using admin email from $GLOBAL_ENV_FILE: $WP_ADMIN_EMAIL"
+            print_info "Using admin email from config: $WP_ADMIN_EMAIL"
         fi
     fi
     while [[ -z "$WP_ADMIN_EMAIL" ]]; do
@@ -1458,7 +1486,7 @@ prompt_instance_config() {
     # Locale
     if global_config_has_value WP_LOCALE; then
         WP_LOCALE="$(global_config_get WP_LOCALE)"
-        print_info "Using locale from $GLOBAL_ENV_FILE: $WP_LOCALE"
+        print_info "Using locale from config: $WP_LOCALE"
     else
         select_locale_prompt "$detected_locale"
     fi
@@ -1466,7 +1494,7 @@ prompt_instance_config() {
     # Timezone
     if global_config_has_value WP_TIMEZONE; then
         apply_timezone_choice "$(global_config_get WP_TIMEZONE)"
-        print_info "Using timezone from $GLOBAL_ENV_FILE: $WP_TIMEZONE"
+        print_info "Using timezone from config: $WP_TIMEZONE"
     else
         select_timezone_prompt "$detected_timezone"
     fi
@@ -1475,9 +1503,9 @@ prompt_instance_config() {
     if global_config_has_value WP_DEBUG; then
         if wp_debug_override=$(parse_bool_value "$(global_config_get WP_DEBUG)"); then
             WP_DEBUG="$wp_debug_override"
-            print_info "Using WP_DEBUG from $GLOBAL_ENV_FILE: $WP_DEBUG"
+            print_info "Using WP_DEBUG from config: $WP_DEBUG"
         else
-            print_warn "Invalid WP_DEBUG in $GLOBAL_ENV_FILE; prompting instead"
+            print_warn "Invalid WP_DEBUG in config; prompting instead"
             WP_DEBUG=""
         fi
     fi
@@ -1495,9 +1523,9 @@ prompt_instance_config() {
             else
                 WP_BLOG_PUBLIC="0"
             fi
-            print_info "Using WP_BLOG_PUBLIC from $GLOBAL_ENV_FILE: $WP_BLOG_PUBLIC"
+            print_info "Using WP_BLOG_PUBLIC from config: $WP_BLOG_PUBLIC"
         else
-            print_warn "Invalid WP_BLOG_PUBLIC in $GLOBAL_ENV_FILE; prompting instead"
+            print_warn "Invalid WP_BLOG_PUBLIC in config; prompting instead"
             WP_BLOG_PUBLIC=""
         fi
     fi
