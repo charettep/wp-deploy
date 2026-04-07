@@ -1338,22 +1338,30 @@ prompt_instance_config() {
         fi
     fi
 
-    # Port
+    # Port — find the next available port starting from the user/config value.
     if global_config_has_value WP_PORT; then
         WP_PORT="$(global_config_get WP_PORT)"
         if ! validate_port_value "$WP_PORT"; then
             print_error "Invalid WP_PORT override '$WP_PORT' in $GLOBAL_ENV_FILE"
             exit 1
         fi
-        if port_is_in_use "$WP_PORT"; then
-            print_error "Configured WP_PORT '$WP_PORT' is already in use"
-            exit 1
-        fi
-        print_info "Using HTTP port from $GLOBAL_ENV_FILE: $WP_PORT"
     else
         read -rp "$(echo -e "${CYAN}HTTP port${NC} [$default_port]: ")" WP_PORT
         WP_PORT="${WP_PORT:-$default_port}"
+        if ! validate_port_value "$WP_PORT"; then
+            print_warn "Invalid port '$WP_PORT', falling back to $default_port"
+            WP_PORT="$default_port"
+        fi
     fi
+    # Scan upward from the chosen value until we find a free port.
+    local original_port="$WP_PORT"
+    while port_is_in_use "$WP_PORT"; do
+        (( WP_PORT++ ))
+    done
+    if [[ "$WP_PORT" != "$original_port" ]]; then
+        print_warn "Port $original_port is in use — using next available port: $WP_PORT"
+    fi
+    print_info "Using HTTP port: $WP_PORT"
 
     # ── Public hostname (Cloudflare tunnel exposure) ─────────────
     # This hostname is routed via:
