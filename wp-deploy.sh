@@ -188,10 +188,10 @@ dc() {
     tmp_env=$(mktemp /tmp/wp-env-XXXXXX)
     sudo cat "$creds_path" > "$tmp_env"
     chmod 600 "$tmp_env"
-    log_cmd "docker compose --env-file $tmp_env $* (cwd=$instance_dir)"
-    (cd "$instance_dir" && docker compose --env-file "$tmp_env" "$@") >> "$log_target" 2>&1
+    log_cmd "sudo docker compose --env-file $tmp_env $* (cwd=$instance_dir)"
+    (cd "$instance_dir" && sudo docker compose --env-file "$tmp_env" "$@") >> "$log_target" 2>&1
     local rc=$?
-    log_info "docker compose $* exited with status $rc"
+    log_info "sudo docker compose $* exited with status $rc"
     rm -f "$tmp_env"
     return $rc
 }
@@ -344,6 +344,11 @@ install_docker() {
             ;;
     esac
     run_sudo systemctl enable --now docker
+    # Add current user to docker group so future logins work without sudo
+    if ! groups "$USER" 2>/dev/null | grep -qw docker; then
+        run_sudo usermod -aG docker "$USER"
+        log_info "Added $USER to docker group (effective after re-login)"
+    fi
 }
 
 check_dependencies() {
@@ -365,20 +370,20 @@ check_dependencies() {
         install_docker
     fi
 
-    # Verify Docker Compose v2 plugin
-    if ! docker compose version &>/dev/null 2>&1; then
+    # Verify Docker Compose v2 plugin (use sudo — user may not be in docker group yet)
+    if ! sudo docker compose version &>/dev/null 2>&1; then
         print_error "Docker Compose v2 not available after Docker install (arch: $ARCH, distro: $DISTRO_ID)"
         exit 1
     fi
 
     # Ensure Docker daemon is running
-    if ! docker info &>/dev/null 2>&1; then
+    if ! sudo docker info &>/dev/null 2>&1; then
         print_info "Starting Docker daemon..."
         run_sudo systemctl start docker
-        # Wait up to 10s for daemon to become available
+        # Wait up to 15s for daemon to become available
         local _d=0
-        until docker info &>/dev/null 2>&1 || (( ++_d >= 10 )); do sleep 1; done
-        if ! docker info &>/dev/null 2>&1; then
+        until sudo docker info &>/dev/null 2>&1 || (( ++_d >= 15 )); do sleep 1; done
+        if ! sudo docker info &>/dev/null 2>&1; then
             print_error "Docker daemon failed to start (arch: $ARCH)"
             exit 1
         fi
@@ -393,8 +398,8 @@ check_dependencies() {
     done
 
     local docker_ver compose_ver
-    docker_ver=$(docker --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' || echo "unknown")
-    compose_ver=$(docker compose version --short 2>/dev/null || echo "unknown")
+    docker_ver=$(sudo docker --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' || echo "unknown")
+    compose_ver=$(sudo docker compose version --short 2>/dev/null || echo "unknown")
     log_info "All dependencies satisfied (arch=$ARCH distro=$DISTRO_ID)"
     print_success "Dependencies OK — docker $docker_ver, compose $compose_ver, arch=$ARCH"
 }
@@ -1699,7 +1704,7 @@ wait_for_mysql() {
     local timeout=60
     local elapsed=0
     while (( elapsed < timeout )); do
-        if docker exec "${INSTANCE_NAME}-mysql" mysqladmin ping -h localhost --silent 2>/dev/null; then
+        if sudo docker exec "${INSTANCE_NAME}-mysql" mysqladmin ping -h localhost --silent 2>/dev/null; then
             print_success "MySQL is ready"
             return 0
         fi
@@ -1757,7 +1762,7 @@ run_wp_cli_install() {
 
     # Helper to run WP-CLI with the correct env
     run_wpcli() {
-        docker run --rm \
+        sudo docker run --rm \
             --network "${INSTANCE_NAME}-net" \
             --volumes-from "${INSTANCE_NAME}-wordpress" \
             --user 33:33 \
@@ -2099,9 +2104,9 @@ cmd_list() {
 
             # Check container status
             local status
-            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}-wordpress$"; then
+            if sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}-wordpress$"; then
                 status="${GREEN}running${NC}  "
-            elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${name}-wordpress$"; then
+            elif sudo docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${name}-wordpress$"; then
                 status="${YELLOW}stopped${NC}  "
             else
                 status="${RED}gone${NC}     "
@@ -2217,7 +2222,7 @@ cmd_backup() {
     fi
 
     # Check containers are running
-    if ! docker ps --format '{{.Names}}' | grep -q "^${name}-mysql$"; then
+    if ! sudo docker ps --format '{{.Names}}' | grep -q "^${name}-mysql$"; then
         print_error "MySQL container not running. Start the instance first:"
         print_error "  ./wp-deploy.sh --start $name"
         exit 1
@@ -2234,7 +2239,7 @@ cmd_backup() {
 
     # MySQL dump
     print_info "Dumping MySQL database..."
-    docker exec "${name}-mysql" mysqldump -u root -p"${MYSQL_ROOT_PASSWORD}" "${MYSQL_DATABASE}" > "/tmp/${name}-dump.sql" 2>/dev/null
+    sudo docker exec "${name}-mysql" mysqldump -u root -p"${MYSQL_ROOT_PASSWORD}" "${MYSQL_DATABASE}" > "/tmp/${name}-dump.sql" 2>/dev/null
 
     # Copy .env to temp
     sudo cp "$creds_path" "/tmp/${name}-backup-env"
@@ -2267,7 +2272,7 @@ cmd_restore() {
     fi
 
     # Stop existing instance if running
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}-wordpress$"; then
+    if sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}-wordpress$"; then
         print_info "Stopping existing instance..."
         dc "$instance_dir" stop 2>/dev/null || true
     fi
@@ -2306,7 +2311,7 @@ cmd_restore() {
     print_info "Waiting for MySQL..."
     local timeout=60 elapsed=0
     while (( elapsed < timeout )); do
-        if docker exec "${name}-mysql" mysqladmin ping -h localhost --silent 2>/dev/null; then
+        if sudo docker exec "${name}-mysql" mysqladmin ping -h localhost --silent 2>/dev/null; then
             break
         fi
         sleep 2
@@ -2316,7 +2321,7 @@ cmd_restore() {
     # Import dump
     if [[ -n "$dump_file" && -f "$dump_file" ]]; then
         print_info "Importing database..."
-        docker exec -i "${name}-mysql" mysql -u root -p"${MYSQL_ROOT_PASSWORD}" "${MYSQL_DATABASE}" < "$dump_file"
+        sudo docker exec -i "${name}-mysql" mysql -u root -p"${MYSQL_ROOT_PASSWORD}" "${MYSQL_DATABASE}" < "$dump_file"
         rm -f "$dump_file"
     fi
 
