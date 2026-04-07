@@ -466,13 +466,27 @@ check_dependencies() {
         exit 1
     fi
 
-    # Ensure Docker daemon is running
+    # Ensure Docker daemon is running.
+    # systemctl may fail in container/VM environments (Android VMs, degraded systemd),
+    # so we try systemctl first, fall back to starting dockerd directly, and let the
+    # timeout loop be the final arbiter of whether Docker is actually available.
     if ! sudo docker info &>/dev/null 2>&1; then
         print_info "Starting Docker daemon..."
-        run_sudo systemctl start docker
-        # Wait up to 15s for daemon to become available
+        if sudo systemctl start docker 2>/dev/null; then
+            log_info "Docker started via systemctl"
+        elif sudo service docker start 2>/dev/null; then
+            log_info "Docker started via service"
+        else
+            log_info "systemctl/service start failed — trying dockerd directly"
+            sudo dockerd --host=unix:///var/run/docker.sock \
+                >> "${LOG_FILE:-/tmp/wp-deploy-preflight.log}" 2>&1 &
+        fi
+        # Wait up to 30s for daemon to become available regardless of start method.
         local _d=0
-        until sudo docker info &>/dev/null 2>&1 || (( ++_d >= 15 )); do sleep 1; done
+        until sudo docker info &>/dev/null 2>&1 || (( _d >= 30 )); do
+            sleep 1
+            (( _d++ )) || true
+        done
         if ! sudo docker info &>/dev/null 2>&1; then
             print_error "Docker daemon failed to start (arch: $ARCH)"
             exit 1
