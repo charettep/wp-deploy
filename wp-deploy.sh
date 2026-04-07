@@ -22,6 +22,18 @@ declare -A GLOBAL_CONFIG=()
 LOG_FILE=""
 CURRENT_STEP=0
 TOTAL_STEPS=16
+# Weighted cumulative end-% per step. Each value is the % the bar shows
+# when that step COMPLETES. Weights reflect typical wall-clock time.
+#  1-detect 2-deps 3-cf 4-config 5-dirs 6-creds 7-compose
+#  8-pull-mysql 9-pull-wp 10-up 11-mysql-wait 12-wp-wait
+#  13-wpcli 14-cf-finalize 15-verify 16-done
+declare -a _STEP_END=(
+    [0]=0
+    [1]=2   [2]=20  [3]=24  [4]=25
+    [5]=26  [6]=27  [7]=28  [8]=38
+    [9]=48  [10]=52 [11]=63 [12]=74
+    [13]=86 [14]=91 [15]=98 [16]=100
+)
 CURRENT_PROGRESS_PERCENT=""
 CURRENT_PROGRESS_MESSAGE=""
 PROGRESS_ACTIVE=false
@@ -236,13 +248,51 @@ step() {
     local message="$2"
     CURRENT_STEP=$step_num
     local percent
-    if [[ $step_num -ge $TOTAL_STEPS ]]; then
-        percent=100
+    if [[ $step_num -le 0 ]]; then
+        percent=0
+    elif [[ $step_num -ge $TOTAL_STEPS ]]; then
+        percent="${_STEP_END[$TOTAL_STEPS]:-100}"
     else
-        percent=$(( step_num * 100 / TOTAL_STEPS ))
+        # Show end-% of the *previous* step (= start of this step)
+        percent="${_STEP_END[$((step_num - 1))]:-0}"
     fi
     progress_bar "$percent" "$message"
     log_info "STEP $step_num/$TOTAL_STEPS: $message"
+}
+
+# Animate the progress bar while a background PID is running.
+# Usage: progress_ticker START_PCT END_PCT "message" BG_PID
+# Returns the exit code of the background process.
+progress_ticker() {
+    local start_pct="$1" end_pct="$2" msg="$3" bg_pid="$4"
+    local pct="$start_pct"
+    # Advance 1% every 0.5 s, but stop 2 points short so we don't
+    # reach the end before the real work is done.
+    local hold=$(( end_pct - 2 ))
+    [[ $hold -lt $start_pct ]] && hold=$start_pct
+    while kill -0 "$bg_pid" 2>/dev/null; do
+        progress_bar "$pct" "$msg"
+        [[ $pct -lt $hold ]] && (( pct++ ))
+        sleep 0.5
+    done
+    wait "$bg_pid"
+    local rc=$?
+    (( rc == 0 )) && progress_bar "$end_pct" "$msg"
+    return $rc
+}
+
+# Run a command in background under sudo and tick the progress bar.
+# Usage: run_sudo_with_tick START_PCT END_PCT "message" -- cmd [args...]
+# Output (stdout+stderr) is appended to LOG_FILE (or a preflight temp log).
+run_sudo_with_tick() {
+    local start_pct="$1" end_pct="$2" msg="$3"
+    shift 3
+    [[ "${1:-}" == "--" ]] && shift
+    local log_target="${LOG_FILE:-/tmp/wp-deploy-preflight.log}"
+    log_cmd "$*"
+    sudo "$@" >> "$log_target" 2>&1 &
+    local bg_pid=$!
+    progress_ticker "$start_pct" "$end_pct" "$msg" "$bg_pid"
 }
 
 print_status_line() {
@@ -356,12 +406,21 @@ check_dependencies() {
 
     # ── System update (apt-based distros) ────────────────────
     if [[ "$PKG_MANAGER" == "apt" ]]; then
-        print_info "Updating system packages (apt update & full-upgrade)..."
-        run_sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq
-        run_sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq \
-            -o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef"
-        run_sudo env DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -qq \
-            -o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef"
+        local apt_log="${LOG_FILE:-/tmp/wp-deploy-preflight.log}"
+        # Run all three apt phases in a single background job so the progress
+        # bar can animate (step 2 spans 2 → 20 % in the weighted table).
+        {
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq \
+                -o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef"
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -qq \
+                -o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef"
+        } >> "$apt_log" 2>&1 &
+        local apt_pid=$!
+        progress_ticker "${_STEP_END[1]}" "${_STEP_END[2]}" "Updating system packages (apt)..." "$apt_pid" || {
+            print_error "System package update failed — check $apt_log"
+            exit 1
+        }
         print_success "System packages up to date"
     fi
 
@@ -1683,18 +1742,25 @@ COMPOSEYAML
 deploy_containers() {
     local instance_dir="$INSTANCES_DIR/$INSTANCE_NAME"
 
-    # Pull latest images
+    # Pull latest images — run in background so the bar can animate.
     step 8 "Pulling MySQL 8.4 image..."
-    print_info "Pulling mysql:8.4..."
-    dc "$instance_dir" pull mysql
+    dc "$instance_dir" pull mysql &
+    progress_ticker "${_STEP_END[7]}" "${_STEP_END[8]}" "Pulling MySQL 8.4 image..." $! || {
+        print_error "Failed to pull mysql:8.4"
+        exit 1
+    }
+    print_success "mysql:8.4 pulled"
 
     step 9 "Pulling WordPress image..."
-    print_info "Pulling wordpress:latest..."
-    dc "$instance_dir" pull wordpress
+    dc "$instance_dir" pull wordpress &
+    progress_ticker "${_STEP_END[8]}" "${_STEP_END[9]}" "Pulling WordPress image..." $! || {
+        print_error "Failed to pull wordpress:latest"
+        exit 1
+    }
+    print_success "wordpress:latest pulled"
 
-    # Start containers
+    # Start containers — fast enough to not need a ticker
     step 10 "Starting containers..."
-    print_info "Starting WordPress and MySQL containers..."
     dc "$instance_dir" up -d
     print_success "Containers started"
 }
@@ -1710,7 +1776,7 @@ wait_for_mysql() {
         fi
         sleep 2
         (( elapsed += 2 ))
-        local pct=$(( 67 + (elapsed * 4 / timeout) ))
+        local pct=$(( ${_STEP_END[10]} + (elapsed * (${_STEP_END[11]} - ${_STEP_END[10]}) / timeout) ))
         progress_bar "$pct" "Waiting for MySQL... (${elapsed}s/${timeout}s)"
     done
     print_error "MySQL failed to start within ${timeout}s"
@@ -1731,7 +1797,7 @@ wait_for_wordpress() {
         fi
         sleep 3
         (( elapsed += 3 ))
-        local pct=$(( 73 + (elapsed * 5 / timeout) ))
+        local pct=$(( ${_STEP_END[11]} + (elapsed * (${_STEP_END[12]} - ${_STEP_END[11]}) / timeout) ))
         progress_bar "$pct" "Waiting for WordPress... (${elapsed}s, HTTP $http_code)"
     done
     print_error "WordPress failed to respond within ${timeout}s"
@@ -1771,7 +1837,9 @@ run_wp_cli_install() {
             "$@"
     }
 
-    # wp core install
+    # wp core install — run in background so the bar animates.
+    # This step spans _STEP_END[12]=74 → ~82% (leaving ~4 pts for options).
+    local core_install_end=$(( ${_STEP_END[12]} + 8 ))
     log_info "Running wp core install..."
     run_wpcli wp core install \
         --url="$url" \
@@ -1780,29 +1848,43 @@ run_wp_cli_install() {
         --admin_password="$WP_ADMIN_PASSWORD" \
         --admin_email="$WP_ADMIN_EMAIL" \
         --skip-email \
-        >> "$LOG_FILE" 2>&1 || {
-            print_error "WP-CLI core install failed — check $LOG_FILE"
-            rm -f "$cli_env"
-            return 1
-        }
+        >> "$LOG_FILE" 2>&1 &
+    local wp_core_pid=$!
+    progress_ticker "${_STEP_END[12]}" "$core_install_end" "Installing WordPress core..." "$wp_core_pid" || {
+        print_error "WP-CLI core install failed — check $LOG_FILE"
+        rm -f "$cli_env"
+        return 1
+    }
 
-    # Set timezone using either a named timezone string or a manual UTC offset.
+    # Options — fast; tick 1% each so the bar visibly advances.
+    local opt_pct=$core_install_end
+
+    # Set timezone
+    progress_bar "$opt_pct" "Setting timezone..."
     if [[ -n "${WP_GMT_OFFSET:-}" ]]; then
         run_wpcli wp option update timezone_string '' >> "$LOG_FILE" 2>&1 || true
         run_wpcli wp option update gmt_offset "$WP_GMT_OFFSET" >> "$LOG_FILE" 2>&1 || true
     else
         run_wpcli wp option update timezone_string "$WP_TIMEZONE" >> "$LOG_FILE" 2>&1 || true
     fi
+    (( opt_pct++ ))
 
-    # Set locale using WordPress language packs instead of the legacy WPLANG option.
+    # Set locale
+    progress_bar "$opt_pct" "Setting locale..."
     if [[ "$WP_LOCALE" != "en_US" ]]; then
         run_wpcli wp language core install "$WP_LOCALE" --activate >> "$LOG_FILE" 2>&1 || true
     else
         run_wpcli wp site switch-language en_US >> "$LOG_FILE" 2>&1 || true
     fi
+    (( opt_pct++ ))
 
     # Set search engine visibility (blog_public: 1=visible, 0=discourage)
+    progress_bar "$opt_pct" "Configuring site settings..."
     run_wpcli wp option update blog_public "$WP_BLOG_PUBLIC" >> "$LOG_FILE" 2>&1 || true
+    (( opt_pct++ ))
+
+    # Ensure we land on the step-13 end boundary
+    progress_bar "${_STEP_END[13]}" "WP-CLI setup complete"
 
     rm -f "$cli_env"
     print_success "WordPress installed and configured"
@@ -1940,8 +2022,8 @@ verify_all_endpoints() {
 
         sleep 5
         (( elapsed += 5 ))
-        local pct=$(( 92 + (elapsed * 6 / timeout) ))
-        [[ $pct -gt 98 ]] && pct=98
+        local pct=$(( ${_STEP_END[14]} + (elapsed * (${_STEP_END[15]} - ${_STEP_END[14]}) / timeout) ))
+        [[ $pct -gt ${_STEP_END[15]} ]] && pct=${_STEP_END[15]}
         progress_bar "$pct" "Waiting for $failed_ep (${failed_reason})... (${elapsed}s/${timeout}s)"
 
         # Re-flush DNS every 30s
