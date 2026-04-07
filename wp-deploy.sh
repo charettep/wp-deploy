@@ -1507,17 +1507,17 @@ generate_credentials() {
     raw_config_extra+="\$_wp_h = preg_replace('/:\\d+\$/', '', \$_SERVER['HTTP_HOST'] ?? ''); "
     if [[ -n "$CF_HOSTNAME" ]]; then
         raw_config_extra+="if (in_array(\$_wp_h, ['localhost', '127.0.0.1', '[::1]'], true)) { "
-        raw_config_extra+=    "define('WP_HOME',    'http://' . (\$_SERVER['HTTP_HOST'] ?? 'localhost')); "
-        raw_config_extra+=    "define('WP_SITEURL', 'http://' . (\$_SERVER['HTTP_HOST'] ?? 'localhost')); "
+        raw_config_extra+="define('WP_HOME', 'http://' . (\$_SERVER['HTTP_HOST'] ?? 'localhost')); "
+        raw_config_extra+="define('WP_SITEURL', 'http://' . (\$_SERVER['HTTP_HOST'] ?? 'localhost')); "
         raw_config_extra+="} else { "
-        raw_config_extra+=    "define('WP_HOME',    'https://${CF_HOSTNAME}'); "
-        raw_config_extra+=    "define('WP_SITEURL', 'https://${CF_HOSTNAME}'); "
-        raw_config_extra+=    "define('FORCE_SSL_ADMIN', true); "
+        raw_config_extra+="define('WP_HOME', 'https://${CF_HOSTNAME}'); "
+        raw_config_extra+="define('WP_SITEURL', 'https://${CF_HOSTNAME}'); "
+        raw_config_extra+="define('FORCE_SSL_ADMIN', true); "
         raw_config_extra+="} "
     else
         raw_config_extra+="if (\$_wp_h !== '') { "
-        raw_config_extra+=    "define('WP_HOME',    'http://' . (\$_SERVER['HTTP_HOST'] ?? 'localhost')); "
-        raw_config_extra+=    "define('WP_SITEURL', 'http://' . (\$_SERVER['HTTP_HOST'] ?? 'localhost')); "
+        raw_config_extra+="define('WP_HOME', 'http://' . (\$_SERVER['HTTP_HOST'] ?? 'localhost')); "
+        raw_config_extra+="define('WP_SITEURL', 'http://' . (\$_SERVER['HTTP_HOST'] ?? 'localhost')); "
         raw_config_extra+="} "
     fi
 
