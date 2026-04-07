@@ -432,6 +432,117 @@ install_docker() {
     fi
 }
 
+_docker_daemon_start() {
+    # Try every available start method; return 0 as soon as one works.
+    local log_target="${LOG_FILE:-/tmp/wp-deploy-preflight.log}"
+    if sudo systemctl start docker >> "$log_target" 2>&1; then
+        log_info "Docker started via systemctl"
+    elif sudo service docker start >> "$log_target" 2>&1; then
+        log_info "Docker started via service"
+    else
+        log_info "systemctl/service unavailable — launching dockerd directly"
+        sudo dockerd >> "$log_target" 2>&1 &
+    fi
+    # Wait up to 30 s regardless of start method.
+    local _d=0
+    until sudo docker info &>/dev/null 2>&1 || [[ $_d -ge 30 ]]; do
+        sleep 1
+        _d=$(( _d + 1 ))
+    done
+    sudo docker info &>/dev/null 2>&1
+}
+
+_write_docker_daemon_json() {
+    # Write a daemon.json tuned for restricted environments:
+    #   iptables:false      → avoids nftables/iptables-legacy failures
+    #   storage-driver:vfs  → works without overlay/overlay2 kernel module
+    sudo mkdir -p /etc/docker
+    local cfg=/etc/docker/daemon.json
+    # Preserve any existing valid config and only add missing keys.
+    if sudo test -f "$cfg" 2>/dev/null; then
+        local existing
+        existing=$(sudo cat "$cfg" 2>/dev/null || echo '{}')
+        # Bail out if it already has the keys we need (avoid double-editing).
+        if echo "$existing" | grep -q '"iptables"' && echo "$existing" | grep -q '"storage-driver"'; then
+            return 0
+        fi
+    fi
+    sudo tee "$cfg" > /dev/null <<'DAEMON_JSON'
+{
+  "iptables": false,
+  "storage-driver": "vfs"
+}
+DAEMON_JSON
+    log_info "Wrote /etc/docker/daemon.json (iptables:false, storage-driver:vfs)"
+}
+
+_purge_reinstall_docker() {
+    local log_target="${LOG_FILE:-/tmp/wp-deploy-preflight.log}"
+    print_info "Removing broken Docker installation..."
+    sudo systemctl stop docker 2>/dev/null || true
+    sudo apt-get purge -y -qq docker-ce docker-ce-cli containerd.io \
+        docker-compose-plugin docker-buildx-plugin 2>>"$log_target" || true
+    sudo apt-get autoremove -y -qq 2>>"$log_target" || true
+    sudo rm -rf /var/lib/docker /var/lib/containerd /etc/docker 2>/dev/null || true
+    print_info "Reinstalling Docker..."
+    install_docker
+}
+
+_start_or_repair_docker() {
+    print_info "Starting Docker daemon..."
+
+    # ── Attempt 1: plain start ──────────────────────────────
+    if _docker_daemon_start; then
+        print_success "Docker daemon is running"
+        return 0
+    fi
+
+    # ── Attempt 2: apply daemon.json fixes and retry ────────
+    print_warn "Docker failed to start — applying compatibility config..."
+    local daemon_log="${LOG_FILE:-/tmp/wp-deploy-preflight.log}"
+    # Capture a snapshot of what dockerd complains about.
+    local daemon_stderr
+    daemon_stderr=$(sudo timeout 5 dockerd 2>&1 | head -30 || true)
+    log_info "dockerd stderr sample: $daemon_stderr"
+
+    _write_docker_daemon_json
+
+    # If iptables error: also switch to iptables-legacy if available.
+    if echo "$daemon_stderr" | grep -qiE 'iptables|nftables'; then
+        if command -v update-alternatives &>/dev/null && \
+           update-alternatives --list iptables 2>/dev/null | grep -q legacy; then
+            sudo update-alternatives --set iptables \
+                /usr/sbin/iptables-legacy >> "$daemon_log" 2>&1 || true
+            sudo update-alternatives --set ip6tables \
+                /usr/sbin/ip6tables-legacy >> "$daemon_log" 2>&1 || true
+            log_info "Switched to iptables-legacy"
+        fi
+    fi
+
+    # Reload systemd so it picks up any changed unit state.
+    sudo systemctl daemon-reload >> "$daemon_log" 2>&1 || true
+
+    if _docker_daemon_start; then
+        print_success "Docker daemon is running (after config fix)"
+        return 0
+    fi
+
+    # ── Attempt 3: purge + reinstall with config pre-applied ─
+    print_warn "Docker still not starting — purging and reinstalling..."
+    _purge_reinstall_docker
+    _write_docker_daemon_json  # write config BEFORE first start
+    sudo systemctl daemon-reload >> "$daemon_log" 2>&1 || true
+
+    if _docker_daemon_start; then
+        print_success "Docker daemon is running (after reinstall)"
+        return 0
+    fi
+
+    print_error "Docker daemon failed to start after reinstall (arch: $ARCH, distro: $DISTRO_ID)"
+    print_error "Check log for details: ${LOG_FILE:-/tmp/wp-deploy-preflight.log}"
+    exit 1
+}
+
 check_dependencies() {
     step 2 "Checking dependencies..."
 
@@ -467,30 +578,8 @@ check_dependencies() {
     fi
 
     # Ensure Docker daemon is running.
-    # systemctl may fail in container/VM environments (Android VMs, degraded systemd),
-    # so we try systemctl first, fall back to starting dockerd directly, and let the
-    # timeout loop be the final arbiter of whether Docker is actually available.
     if ! sudo docker info &>/dev/null 2>&1; then
-        print_info "Starting Docker daemon..."
-        if sudo systemctl start docker 2>/dev/null; then
-            log_info "Docker started via systemctl"
-        elif sudo service docker start 2>/dev/null; then
-            log_info "Docker started via service"
-        else
-            log_info "systemctl/service start failed — trying dockerd directly"
-            sudo dockerd --host=unix:///var/run/docker.sock \
-                >> "${LOG_FILE:-/tmp/wp-deploy-preflight.log}" 2>&1 &
-        fi
-        # Wait up to 30s for daemon to become available regardless of start method.
-        local _d=0
-        until sudo docker info &>/dev/null 2>&1 || (( _d >= 30 )); do
-            sleep 1
-            (( _d++ )) || true
-        done
-        if ! sudo docker info &>/dev/null 2>&1; then
-            print_error "Docker daemon failed to start (arch: $ARCH)"
-            exit 1
-        fi
+        _start_or_repair_docker
     fi
 
     # ── Other tools ──────────────────────────────────────────
